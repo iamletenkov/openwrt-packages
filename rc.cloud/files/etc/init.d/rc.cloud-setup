@@ -1,160 +1,127 @@
 #!/bin/sh /etc/rc.common
-# SPDX-License-Identifier: MIT
-# cloud-init lite – setup phase
+# ➊ Ранняя стадия (до поднятия сети):
+#     • монтирует /dev/sr0 (cidata) → /mnt/cidata
+#     • читает meta-data (instance-id – для логов)
+#     • парсит network-config и настраивает UCI + DNS
+# ➋ Оставляет ISO примонтированной – её используют следующие скрипты
+
 START=47
 STOP=10
 USE_PROCD=1
 
-CIDATA_MNT=/run/cidata
-MAX_TRIES=${cloud_tries:-30}      # можно изменить в ядре: cloud_tries=N
-RETRY_SEC=1
+CIDATA_DEV="/dev/sr0"
+CIDATA_DIR="/mnt/cidata"
 
-# --- helpers ---------------------------------------------------------------
-log()    { logger -t rc.cloud-setup "$*"; }
-dbg()    { [ "$cloud_debug" = "1" ] && log "DEBUG: $*"; }
-
-find_cidata_dev() {
-	# 1) /dev/sr0 (Proxmox доставляет ISO именно туда)
-	[ -b /dev/sr0 ] && echo /dev/sr0 && return
-	# 2) поиск по LABEL=cidata|CIDATA
-	local dev
-	for label in cidata CIDATA ; do
-		dev=$(blkid -L "$label" 2>/dev/null) && [ -b "$dev" ] && { echo "$dev"; return; }
-	done
-}
-
+# ---------- helpers --------------------------------------------------------
 mount_cidata() {
-	local dev
-	dev=$(find_cidata_dev) || return 1
-	mkdir -p "$CIDATA_MNT"
-	# iso9660 (cloud-init NoCloud) или vfat (OpenStack config-drive)
-	mount -o ro "$dev" "$CIDATA_MNT" 2>/dev/null && return 0
-	umount "$dev" 2>/dev/null
-	rmdir "$CIDATA_MNT"
-	return 1
+	[ -d "$CIDATA_DIR" ] || mkdir -p "$CIDATA_DIR"
+	mountpoint -q "$CIDATA_DIR" && return 0
+	mount -o ro "$CIDATA_DEV" "$CIDATA_DIR" 2>/dev/null
 }
 
-yaml_get() { # <key> <file>
-	awk -F': *' -v k="$1" '$1==k{print $2;exit}' "$2" | tr -d '"'\'' '
-}
-
-# ---------- network-config parsing -----------------------------------------
-parse_net_ifaces() { # → iface|proto|ip|mask|gw
+# iface|proto|ip|mask|gw  (только physical-блоки)
+parse_network_config() {
 	awk '
-		function flush() { if(i) printf "%s|%s|%s|%s|%s\n", i,p,ip,msk,gw }
-		/^[[:space:]]*-[[:space:]]*type:[[:space:]]*physical/ { flush(); i=p=ip=msk=gw=""; next }
-		/^[[:space:]]*name:[[:space:]]*/       { i=$2 }
-		/-[[:space:]]*type:[[:space:]]*static/ { p="static" }
-		/-[[:space:]]*type:[[:space:]]*dhcp4/  { p="dhcp" }
-		/^[[:space:]]*address:[[:space:]]*/    { ip=$2 }
-		/^[[:space:]]*netmask:[[:space:]]*/    { msk=$2 }
-		/^[[:space:]]*gateway:[[:space:]]*/    { gw=$2 }
+		function flush(){ if(iface) printf "%s|%s|%s|%s|%s\n", iface, proto, ip, mask, gw }
+		/^[[:space:]]*-[[:space:]]*type:[[:space:]]*physical/{ flush(); iface=proto=ip=mask=gw=""; next }
+		/^[[:space:]]*name:/{ iface=$2 }
+		/-[[:space:]]*type:[[:space:]]*static/{ proto="static" }
+		/-[[:space:]]*type:[[:space:]]*dhcp4/{ proto="dhcp" }
+		/^[[:space:]]*address:/{ ip=$2 }
+		/^[[:space:]]*netmask:/{ mask=$2 }
+		/^[[:space:]]*gateway:/{ gw=$2 }
 		END{ flush() }
-	' "$1" | tr -d '"'\'' '
+	' "$1" | tr -d "\"'"
 }
 
-parse_nameserver() { # → dns|search
+# nameserver-блок → DNS|search
+read_dns_search() {
 	awk '
-		BEGIN{dns=search=""}
+		BEGIN{dns="";search=""}
 		/^[[:space:]]*-.*type:[[:space:]]*nameserver/{ns=1;next}
-		ns && /^[[:space:]]*address:/{addr=1;next}
-		ns && /^[[:space:]]*search:/{addr=0;srch=1;next}
-		addr && /^[[:space:]]*-[[:space:]]*/{gsub(/[^0-9.]/,"");dns=$0}
-		srch && /^[[:space:]]*-[[:space:]]*/{gsub(/[^A-Za-z0-9_.-]/,"");search=$0}
-		END{printf "%s|%s\n",dns,search}
+		ns && /^[[:space:]]*address:/{adr=1;next}
+		ns && /^[[:space:]]*search:/{adr=0;srch=1;next}
+		adr && /^[[:space:]]*-[[:space:]]*/{gsub(/[^0-9.]/,"",$2); dns=$2}
+		srch&&/^[[:space:]]*-[[:space:]]*/{gsub(/[^A-Za-z0-9_.-]/,"",$2); search=$2}
+		END{print dns"|"search}
 	' "$1"
 }
 
 apply_network_config() {
-	local f="$1" idx=0 lan
-	local dns search
-	IFS='|' read dns search <<EOF
-$(parse_nameserver "$f")
+	local cfg="$1"
+
+	# ---- DNS / search ------------------------------------------------------
+	IFS='|' read DNS SEARCH <<EOF
+$(read_dns_search "$cfg")
 EOF
-	[ -n "$dns" ]   && dns=$(echo "$dns"   | tr -d ' ')
-	[ -n "$search" ]&& search=$(echo "$search" | tr -d ' ')
+	DNS=$(echo "$DNS" | tr -d ' ')
+	SEARCH=$(echo "$SEARCH" | tr -d ' ')
 
-	# очищаем дефолтные lan/wan
-	uci -q delete network.lan
-	uci -q delete network.wan
+	: > /etc/resolv.conf.head
+	[ -n "$SEARCH" ] && echo "search $SEARCH"   >> /etc/resolv.conf.head
+	[ -n "$DNS"    ] && echo "nameserver $DNS" >> /etc/resolv.conf.head
+	cp /etc/resolv.conf.head /etc/resolv.conf
+
+	# ---- UCI сети ----------------------------------------------------------
 	uci -q delete network.@device[0]
+	uci -q delete network.lan
 
-	parse_net_ifaces "$f" | while IFS='|' read iface proto ip mask gw; do
-		local name
-		if [ $idx -eq 0 ]; then name=wan; else name=lan$idx; fi
+	local idx=0
+	parse_network_config "$cfg" | while IFS='|' read IFACE PROTO IP NM GW; do
+		local name; [ "$idx" = 0 ] && name="wan" || name="lan$idx"
 
-		uci batch <<-UCI
-			set network.$name=interface
-			set network.$name.device='$iface'
-			set network.$name.proto='${proto:-dhcp}'
-		UCI
+		uci set network.$name=interface
+		uci set network.$name.device="$IFACE"
+		uci set network.$name.proto="${PROTO:-dhcp}"
 
-		if [ "$proto" = "static" ]; then
-			[ -n "$ip"   ] && uci set network.$name.ipaddr="$ip"
-			[ -n "$mask" ] && uci set network.$name.netmask="$mask"
-			[ -n "$gw"   ] && uci set network.$name.gateway="$gw"
+		if [ "$PROTO" = "static" ]; then
+			[ -n "$IP" ] && uci set network.$name.ipaddr="$IP"
+			[ -n "$NM" ] && uci set network.$name.netmask="$NM"
+			[ -n "$GW" ] && uci set network.$name.gateway="$GW"
 		fi
 
-		if [ $idx -eq 0 ] && [ -n "$dns" ]; then
+		# DNS только для первого интерфейса
+		if [ "$idx" = 0 ] && [ -n "$DNS" ]; then
 			uci set network.$name.peerdns='0'
-			uci set network.$name.dns="$dns"
+			uci set network.$name.dns="$DNS"
 		fi
 		idx=$((idx+1))
 	done
-
-	if [ -n "$search$dns" ]; then
-		: > /etc/resolv.conf.head
-		[ -n "$search" ] && echo "search $search"    >> /etc/resolv.conf.head
-		[ -n "$dns"    ] && echo "nameserver $dns"   >> /etc/resolv.conf.head
-		cp /etc/resolv.conf.head /etc/resolv.conf
-	fi
-
 	uci commit network
+
+	# DHCP-сервер на первой LAN (если она есть)
+	if uci -q get network.lan1 > /dev/null 2>&1; then
+		uci set dhcp.lan1=dhcp
+		uci set dhcp.lan1.interface='lan1'
+		uci set dhcp.lan1.start='10'
+		uci set dhcp.lan1.limit='150'
+		uci set dhcp.lan1.leasetime='2m'
+		uci commit dhcp
+		uci set firewall.@zone[1].input='ACCEPT'
+		uci set firewall.@zone[1].forward='ACCEPT'
+		uci commit firewall
+	fi
 }
 
-# -------------------------- main -------------------------------------------
 start_service() {
-	local try=1
-	while [ $try -le $MAX_TRIES ]; do
-		mount_cidata && break
-		dbg "try $try/$MAX_TRIES – cidata not found"
-		sleep $RETRY_SEC
-		try=$((try+1))
-	done
-
-	if [ ! -d "$CIDATA_MNT" ]; then
-		log "cidata not found after $MAX_TRIES tries – skipping cloud-init"
+	mount_cidata || {
+		logger -t rc.cloud-setup "cidata not found on ${CIDATA_DEV} – skipping"
 		return 0
-	fi
-	log "cidata mounted from $(find_cidata_dev)"
+	}
 
-	# --- 1. hostname + root-password ---------------------------------------
-	if [ -f "$CIDATA_MNT/user-data" ]; then
-		local ud="$CIDATA_MNT/user-data"
-		local host pass
-		host=$(yaml_get fqdn "$ud")
-		pass=$(yaml_get password "$ud")
-
-		[ -n "$host" ] && {
-			uci set system.@system[0].hostname="$host"
-			uci commit system
-			log "hostname set to '$host'"
-		}
-
-		if [ -n "$pass" ]; then
-			sed -i "s|^root:[^:]*:|root:${pass}:|" /etc/shadow
-			log "root password hash applied from user-data"
-		fi
+	# meta-data (только логируем instance-id)
+	if [ -f "$CIDATA_DIR/meta-data" ]; then
+		local iid
+		iid=$(grep -m1 '^instance-id' "$CIDATA_DIR/meta-data" | cut -d' ' -f2-)
+		[ -n "$iid" ] && logger -t rc.cloud-setup "instance-id: $iid"
 	fi
 
-	# --- 2. network -----------------------------------------------
-	if [ -f "$CIDATA_MNT/network-config" ]; then
-		apply_network_config "$CIDATA_MNT/network-config"
-		log "network-config applied"
+	# network-config → UCI
+	if [ -f "$CIDATA_DIR/network-config" ]; then
+		logger -t rc.cloud-setup "applying network-config"
+		apply_network_config "$CIDATA_DIR/network-config"
+		/etc/init.d/network restart
 	fi
-
-	/etc/init.d/network restart >/dev/null 2>&1
-	umount "$CIDATA_MNT" && rmdir "$CIDATA_MNT"
 }
 
 stop_service() { :; }

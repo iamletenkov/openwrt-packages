@@ -1,21 +1,39 @@
 #!/bin/sh /etc/rc.common
-# cloud-init lite – userdata phase
+# Поздняя стадия: hostname + root-пароль из user-data
+
 START=91
 STOP=10
 USE_PROCD=1
 
-CIDATA_MNT=/run/cidata
+CIDATA_DEV="/dev/sr0"
+CIDATA_DIR="/mnt/cidata"
+
+mount_cidata() {
+	[ -d "$CIDATA_DIR" ] || mkdir -p "$CIDATA_DIR"
+	mountpoint -q "$CIDATA_DIR" && return 0
+	mount -o ro "$CIDATA_DEV" "$CIDATA_DIR" 2>/dev/null
+}
 
 start_service() {
-	[ -d "$CIDATA_MNT" ] || mount -o ro $(blkid -L cidata 2>/dev/null) "$CIDATA_MNT" 2>/dev/null || return 0
-	[ -f "$CIDATA_MNT/user-data" ] || { umount "$CIDATA_MNT"; rmdir "$CIDATA_MNT"; return 0; }
+	mount_cidata || return 0
 
-	case "$(head -n1 "$CIDATA_MNT/user-data")" in
-		("#cloud-config"*)  ;;                       # YAML – пока игнорируем
-		("#!"*"/"*sh*)      . "$CIDATA_MNT/user-data";; # shell-скрипт
-		(*)                 chmod +x "$CIDATA_MNT/user-data"; "$CIDATA_MNT/user-data";;
-	esac
+	local ud="$CIDATA_DIR/user-data"
+	[ -f "$ud" ] || return 0
 
-	umount "$CIDATA_MNT" && rmdir "$CIDATA_MNT"
+	local host hash
+	host=$(awk -F': *' '$1=="fqdn"{print $2;exit}'  "$ud" | tr -d ' "')
+	hash=$(awk -F': *' '$1=="password"{print $2;exit}' "$ud" | tr -d ' "')
+
+	[ -n "$host" ] && {
+		uci set system.@system[0].hostname="$host"
+		uci commit system
+		logger -t rc.cloud-userdata "hostname set to $host"
+	}
+
+	if [ -n "$hash" ]; then
+		sed -i "s|^root:[^:]*:|root:${hash}:|" /etc/shadow
+		logger -t rc.cloud-userdata "root password hash applied"
+	fi
 }
+
 stop_service() { :; }

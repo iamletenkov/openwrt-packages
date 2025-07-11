@@ -1,10 +1,19 @@
 #!/bin/sh /etc/rc.common
-# cloud-init lite – final phase (marker)
+# Финальная стадия: просто лог + отмонтирование ISO
+
 START=92
 STOP=10
 USE_PROCD=1
 
+CIDATA_DIR="/mnt/cidata"
+
 start_service() {
-	logger -t rc.cloud-final "===== rc.cloud-final: system completely up at $(date) ====="
+	logger -t rc.cloud-final "===== rc.cloud-final: system completely up ====="
+
+	if mountpoint -q "$CIDATA_DIR"; then
+		umount "$CIDATA_DIR"
+		rmdir  "$CIDATA_DIR"
+	fi
 }
+
 stop_service() { :; }
