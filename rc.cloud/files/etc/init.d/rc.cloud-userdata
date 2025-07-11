@@ -1,42 +1,21 @@
 #!/bin/sh /etc/rc.common
-# vi: ts=4 expandtab
-
-XN=rc.cloud-userdata
-. ${IPKG_INSTROOT}/etc/init.d/rc.cloud-functions
-
+# cloud-init lite – userdata phase
 START=91
+STOP=10
+USE_PROCD=1
 
-start() {
-    local iid="" shebang="" a="" udf="${STATE_D}/userdata"
-    is_nocloud && return 0
-    get_vars
-    [ -z ${_iid} ] &&
-        { msg "failed to read instance id"; return 1; }
-    iid=${_iid}
+CIDATA_MNT=/run/cidata
 
-    marked ${iid} &&
-        { msg "user data previously read"; return 0; }
+start_service() {
+	[ -d "$CIDATA_MNT" ] || mount -o ro $(blkid -L cidata 2>/dev/null) "$CIDATA_MNT" 2>/dev/null || return 0
+	[ -f "$CIDATA_MNT/user-data" ] || { umount "$CIDATA_MNT"; rmdir "$CIDATA_MNT"; return 0; }
 
-    mark ${iid}
+	case "$(head -n1 "$CIDATA_MNT/user-data")" in
+		("#cloud-config"*)  ;;                       # YAML – пока игнорируем
+		("#!"*"/"*sh*)      . "$CIDATA_MNT/user-data";; # shell-скрипт
+		(*)                 chmod +x "$CIDATA_MNT/user-data"; "$CIDATA_MNT/user-data";;
+	esac
 
-    if [ -d "${OS_DATA}" ]; then
-        cp "${OS_DATA}/user_data" "${udf}"  2>/dev/null &&
-            { msg "read user_data: ${OS_DATA}/user_data"; return 1; }
-    elif [ -d "${EC2_DATA}" ]; then
-        cp "${EC2_DATA}/user-data" "${udf}" 2>/dev/null &&
-            { msg "read user-data: ${EC2_DATA}/user-data"; return 1; }
-    else
-        wget -q -O - "${UDURL}" > "${udf}" ||
-            { msg "failed to read user data url: ${UDURL}"; return 1; }
-    fi
-
-    if [ -r "${udf}" ]; then
-        shebang="#!"
-        read a < "${udf}"
-        [ "${a#${shebang}}" = "${a}" ] &&
-            { msg "user data not a script"; return 0; }
-
-        chmod 755 "${udf}"
-        exec "${udf}"
-    fi
+	umount "$CIDATA_MNT" && rmdir "$CIDATA_MNT"
 }
+stop_service() { :; }

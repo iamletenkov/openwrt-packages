@@ -1,127 +1,160 @@
 #!/bin/sh /etc/rc.common
-# vi: ts=4 expandtab
-
-XN=rc.cloud-setup
-. ${IPKG_INSTROOT}/etc/init.d/rc.cloud-functions
-
+# SPDX-License-Identifier: MIT
+# cloud-init lite – setup phase
 START=47
+STOP=10
+USE_PROCD=1
 
-start() {
-    local i=0 max=30 iid="" uptime="" toks="" n="" cmdline="" keydir="" md_cd=""
-    is_nocloud &&
-        { msg "nocloud specified, not using metadata"; return 0; }
-    read cmdline < /proc/cmdline
-    [ -f "${STATE_D}/cloud_tries" ] && read max < "${STATE_D}/cloud_tries"
-    for n in ${cmdline}; do
-        case "${n}" in
-            cloud_tries=*) max=${n#cloud_tries=}; break;;
-            ds=nocloud*)
-                msg "kernel option nocloud specified. not using md"; return 0;;
-        esac
-    done
-    [ ${max} -lt 0 ] && max=$((60*60*24*3)) ; # 3 days, is plenty
+CIDATA_MNT=/run/cidata
+MAX_TRIES=${cloud_tries:-30}      # можно изменить в ядре: cloud_tries=N
+RETRY_SEC=1
 
-    # look for config-drive first
-    md_cd=$(blkid -t LABEL="config-2" -odevice)
-    if [[ -n ${md_cd} ]]; then
-        msg "found config drive on ${md_cd}"
-        mkdir -p ${CD_MNT}
-        mount -t iso9660 -o ro mount ${md_cd} ${CD_MNT}
-    fi
+# --- helpers ---------------------------------------------------------------
+log()    { logger -t rc.cloud-setup "$*"; }
+dbg()    { [ "$cloud_debug" = "1" ] && log "DEBUG: $*"; }
 
-    msg "getting instance-id"
-    i=0
-    while [ $i -lt ${max} ] && i=$(($i+1)); do
-        read uptime cputime < /proc/uptime
-        iid=""
-        if mdget instance-id; then
-            # Get EC2 ID
-            iid=${_RET}
-            [ "${iid#i-}" != "${iid}" ] && break
-            msg "failed $i/${max}: up ${uptime}. iid had ${iid}"
-        else
-            if mdget uuid; then
-                # Get OpenStack uuid
-                iid=${_RET}
-                break
-            else
-                msg "failed $i/${max}: up ${uptime}. request failed"
-            fi
-        fi
-        sleep 1
-        if [ $i -eq "${MD_DEBUG_COUNT}" ]; then
-            msg "after ${MD_DEBUG_COUNT} fails, debugging"
-            mddebug
-        fi
-    done
-
-    if [ -n "${iid}" ]; then
-        msg "successful after ${i}/${max} tries: up ${uptime}. iid=${iid}"
-    else
-        msg "failed to read iid from metadata. tried ${max}"; return 1;
-    fi
-
-    marked ${iid} &&
-        { msg "previously ran for ${iid}"; return 0; }
-    mark ${iid}
-    save_var -n _iid=${iid}
-
-    host_name=$(mdget local-hostname -)
-    [ -z $host_name ] && host_name=$(mdget hostname -)
-    uci set system.@system[0].hostname=${host_name%%\.*}
-    uci commit
-    echo "${host_name%%\.*}" >/proc/sys/kernel/hostname
-    save_var _hostname=${host_name%%\.*}
-
-    admin_pass=$(mdget admin_pass -)
-    save_var _admin_pass=${admin_pass}
-
-    mkdir -p /root/.ssh
-    chmod 700 /root/.ssh
-
-    keydir=/etc/dropbear
-    [ -d ${keydir} ] || keydir=/root/.ssh
-    if [[ -n ${md_cd} ]]; then
-        # OpenStack keys come in multiple forms
-        i=0
-        keys=$(jq -r '.keys|.[]|.name' ${OS_DATA}/meta_data.json 2>/dev/null)
-        if [ "${keys}" != "" ]; then
-            for k in ${keys}; do
-                if [ "$(jq -r '.keys|.['${i}']|.type' ${OS_DATA}/meta_data.json 2>/dev/null)" == "ssh" ]; then
-                    authkey=$(jq -r '.keys|.['${i}']|.data' ${OS_DATA}/meta_data.json 2>/dev/null)
-                    if ! grep -q "${authkey}" ${keydir}/authorized_keys; then
-                        echo ${authkey} >>${keydir}/authorized_keys
-                    fi
-                fi
-                i=$(($i+1))
-            done
-        else
-            keyname=$(jq -r '.public_keys|keys[0]' ${OS_DATA}/meta_data.json 2>/dev/null)
-            authkey=$(jq -r '.public_keys|.[]' ${OS_DATA}/meta_data.json 2>/dev/null)
-            if ! grep -q "${authkey}" ${keydir}/authorized_keys; then
-                echo ${authkey} >>${keydir}/authorized_keys
-            fi
-        fi
-    else
-        mdget public-keys/ "${TMPF}"
-        echo >> "${TMPF}" # while loop will fail if no trailing newline
-        keys=""
-        while read line; do
-            keys="${keys} ${line}"
-        done < "${TMPF}"
-        keys=${keys# }
-        # keys is list of [0-9]=name
-        if [ -n "${keys}" ]; then
-            # name maintained for log compatability
-            msg "cloudinit: getting ssh keys: [${keys}]"
-            for toks in ${keys}; do
-                n=${toks%%=*}
-                authkey=$(mdget public-keys/${n}/openssh-key -)
-                if ! grep -q ${authkey} ${keydir}/authorized_keys; then
-                    echo ${authkey} >>${keydir}/authorized_keys
-                fi
-            done
-        fi
-    fi
-    return 0
+find_cidata_dev() {
+	# 1) /dev/sr0 (Proxmox доставляет ISO именно туда)
+	[ -b /dev/sr0 ] && echo /dev/sr0 && return
+	# 2) поиск по LABEL=cidata|CIDATA
+	local dev
+	for label in cidata CIDATA ; do
+		dev=$(blkid -L "$label" 2>/dev/null) && [ -b "$dev" ] && { echo "$dev"; return; }
+	done
 }
+
+mount_cidata() {
+	local dev
+	dev=$(find_cidata_dev) || return 1
+	mkdir -p "$CIDATA_MNT"
+	# iso9660 (cloud-init NoCloud) или vfat (OpenStack config-drive)
+	mount -o ro "$dev" "$CIDATA_MNT" 2>/dev/null && return 0
+	umount "$dev" 2>/dev/null
+	rmdir "$CIDATA_MNT"
+	return 1
+}
+
+yaml_get() { # <key> <file>
+	awk -F': *' -v k="$1" '$1==k{print $2;exit}' "$2" | tr -d '"'\'' '
+}
+
+# ---------- network-config parsing -----------------------------------------
+parse_net_ifaces() { # → iface|proto|ip|mask|gw
+	awk '
+		function flush() { if(i) printf "%s|%s|%s|%s|%s\n", i,p,ip,msk,gw }
+		/^[[:space:]]*-[[:space:]]*type:[[:space:]]*physical/ { flush(); i=p=ip=msk=gw=""; next }
+		/^[[:space:]]*name:[[:space:]]*/       { i=$2 }
+		/-[[:space:]]*type:[[:space:]]*static/ { p="static" }
+		/-[[:space:]]*type:[[:space:]]*dhcp4/  { p="dhcp" }
+		/^[[:space:]]*address:[[:space:]]*/    { ip=$2 }
+		/^[[:space:]]*netmask:[[:space:]]*/    { msk=$2 }
+		/^[[:space:]]*gateway:[[:space:]]*/    { gw=$2 }
+		END{ flush() }
+	' "$1" | tr -d '"'\'' '
+}
+
+parse_nameserver() { # → dns|search
+	awk '
+		BEGIN{dns=search=""}
+		/^[[:space:]]*-.*type:[[:space:]]*nameserver/{ns=1;next}
+		ns && /^[[:space:]]*address:/{addr=1;next}
+		ns && /^[[:space:]]*search:/{addr=0;srch=1;next}
+		addr && /^[[:space:]]*-[[:space:]]*/{gsub(/[^0-9.]/,"");dns=$0}
+		srch && /^[[:space:]]*-[[:space:]]*/{gsub(/[^A-Za-z0-9_.-]/,"");search=$0}
+		END{printf "%s|%s\n",dns,search}
+	' "$1"
+}
+
+apply_network_config() {
+	local f="$1" idx=0 lan
+	local dns search
+	IFS='|' read dns search <<EOF
+$(parse_nameserver "$f")
+EOF
+	[ -n "$dns" ]   && dns=$(echo "$dns"   | tr -d ' ')
+	[ -n "$search" ]&& search=$(echo "$search" | tr -d ' ')
+
+	# очищаем дефолтные lan/wan
+	uci -q delete network.lan
+	uci -q delete network.wan
+	uci -q delete network.@device[0]
+
+	parse_net_ifaces "$f" | while IFS='|' read iface proto ip mask gw; do
+		local name
+		if [ $idx -eq 0 ]; then name=wan; else name=lan$idx; fi
+
+		uci batch <<-UCI
+			set network.$name=interface
+			set network.$name.device='$iface'
+			set network.$name.proto='${proto:-dhcp}'
+		UCI
+
+		if [ "$proto" = "static" ]; then
+			[ -n "$ip"   ] && uci set network.$name.ipaddr="$ip"
+			[ -n "$mask" ] && uci set network.$name.netmask="$mask"
+			[ -n "$gw"   ] && uci set network.$name.gateway="$gw"
+		fi
+
+		if [ $idx -eq 0 ] && [ -n "$dns" ]; then
+			uci set network.$name.peerdns='0'
+			uci set network.$name.dns="$dns"
+		fi
+		idx=$((idx+1))
+	done
+
+	if [ -n "$search$dns" ]; then
+		: > /etc/resolv.conf.head
+		[ -n "$search" ] && echo "search $search"    >> /etc/resolv.conf.head
+		[ -n "$dns"    ] && echo "nameserver $dns"   >> /etc/resolv.conf.head
+		cp /etc/resolv.conf.head /etc/resolv.conf
+	fi
+
+	uci commit network
+}
+
+# -------------------------- main -------------------------------------------
+start_service() {
+	local try=1
+	while [ $try -le $MAX_TRIES ]; do
+		mount_cidata && break
+		dbg "try $try/$MAX_TRIES – cidata not found"
+		sleep $RETRY_SEC
+		try=$((try+1))
+	done
+
+	if [ ! -d "$CIDATA_MNT" ]; then
+		log "cidata not found after $MAX_TRIES tries – skipping cloud-init"
+		return 0
+	fi
+	log "cidata mounted from $(find_cidata_dev)"
+
+	# --- 1. hostname + root-password ---------------------------------------
+	if [ -f "$CIDATA_MNT/user-data" ]; then
+		local ud="$CIDATA_MNT/user-data"
+		local host pass
+		host=$(yaml_get fqdn "$ud")
+		pass=$(yaml_get password "$ud")
+
+		[ -n "$host" ] && {
+			uci set system.@system[0].hostname="$host"
+			uci commit system
+			log "hostname set to '$host'"
+		}
+
+		if [ -n "$pass" ]; then
+			sed -i "s|^root:[^:]*:|root:${pass}:|" /etc/shadow
+			log "root password hash applied from user-data"
+		fi
+	fi
+
+	# --- 2. network -----------------------------------------------
+	if [ -f "$CIDATA_MNT/network-config" ]; then
+		apply_network_config "$CIDATA_MNT/network-config"
+		log "network-config applied"
+	fi
+
+	/etc/init.d/network restart >/dev/null 2>&1
+	umount "$CIDATA_MNT" && rmdir "$CIDATA_MNT"
+}
+
+stop_service() { :; }

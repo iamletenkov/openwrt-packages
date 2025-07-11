@@ -1,39 +1,33 @@
-# rc.cloud
-
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=rc.cloud
-PKG_VERSION:=0.3
+PKG_VERSION:=0.4
 PKG_RELEASE:=1
+
+PKG_MAINTAINER:=Ilya Letenkov <iamletenkov@gmail.com>
+PKG_LICENSE:=MIT
 
 include $(INCLUDE_DIR)/package.mk
 
 define Package/rc.cloud
-  SECTION:=base
-  CATEGORY:=Base system
-  TITLE:=RC commands for cloud instance
-  DEPENDS:=+blkid +wget +jq
+  SECTION:=utils
+  CATEGORY:=Utilities
+  TITLE:=Minimal cloud-init for OpenWrt
+  DEPENDS:=+logd
 endef
 
 define Package/rc.cloud/description
-  RC commands for cloud instance
-  Minimal shell implementation of smoser's cloud-init
-endef
-
-define Build/Prepare
-	mkdir -p $(PKG_BUILD_DIR)
-endef
-
-define Build/Compile/Default
-endef
-
-define Build/Compile
-	$(call Build/Compile/Default)
+Tiny replacement for cloud-init:
+• Находит config-drive (CIDATA) или metadata-service
+• Применяет hostname, root-пароль, SSH-ключи
+• Читает network-config и настраивает сети (WAN/LAN…)
 endef
 
 define Package/rc.cloud/install
-	$(CP) ./files/* $(1)/
+	$(INSTALL_DIR) $(1)/etc/init.d
+	$(INSTALL_BIN) ./files/rc.cloud-setup    $(1)/etc/init.d/rc.cloud-setup
+	$(INSTALL_BIN) ./files/rc.cloud-userdata $(1)/etc/init.d/rc.cloud-userdata
+	$(INSTALL_BIN) ./files/rc.cloud-final    $(1)/etc/init.d/rc.cloud-final
 endef
 
 $(eval $(call BuildPackage,rc.cloud))
-
