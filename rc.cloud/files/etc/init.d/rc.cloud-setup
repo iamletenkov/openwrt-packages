@@ -1,127 +1,147 @@
 #!/bin/sh /etc/rc.common
-# ➊ Ранняя стадия (до поднятия сети):
-#     • монтирует /dev/sr0 (cidata) → /mnt/cidata
-#     • читает meta-data (instance-id – для логов)
-#     • парсит network-config и настраивает UCI + DNS
-# ➋ Оставляет ISO примонтированной – её используют следующие скрипты
-
+#  Early stage: монтируем cidata, применяем meta-data и network-config
 START=47
-STOP=10
 USE_PROCD=1
+PROG="rc.cloud-setup"
 
-CIDATA_DEV="/dev/sr0"
-CIDATA_DIR="/mnt/cidata"
+# ————————————————— helpers ————————————————————————————————
 
-# ---------- helpers --------------------------------------------------------
-mount_cidata() {
-	[ -d "$CIDATA_DIR" ] || mkdir -p "$CIDATA_DIR"
-	mountpoint -q "$CIDATA_DIR" && return 0
-	mount -o ro "$CIDATA_DEV" "$CIDATA_DIR" 2>/dev/null
-}
+# BusyBox может собираться без mountpoint → сделаем alias.
+command -v mountpoint >/dev/null 2>&1 || alias mountpoint='busybox mountpoint'
 
-# iface|proto|ip|mask|gw  (только physical-блоки)
+CIDATA_MNT=/mnt/cidata
+
+# YAML → iface|proto|ip|mask|gw  (physical-blocks only)
 parse_network_config() {
 	awk '
 		function flush(){ if(iface) printf "%s|%s|%s|%s|%s\n", iface, proto, ip, mask, gw }
 		/^[[:space:]]*-[[:space:]]*type:[[:space:]]*physical/{ flush(); iface=proto=ip=mask=gw=""; next }
-		/^[[:space:]]*name:/{ iface=$2 }
-		/-[[:space:]]*type:[[:space:]]*static/{ proto="static" }
-		/-[[:space:]]*type:[[:space:]]*dhcp4/{ proto="dhcp" }
-		/^[[:space:]]*address:/{ ip=$2 }
-		/^[[:space:]]*netmask:/{ mask=$2 }
-		/^[[:space:]]*gateway:/{ gw=$2 }
+		/^[[:space:]]*name:/          { iface=$2 }
+		/-[[:space:]]*type:[[:space:]]*static/ { proto="static" }
+		/-[[:space:]]*type:[[:space:]]*dhcp4/  { proto="dhcp" }
+		/^[[:space:]]*address:/       { ip=$2 }
+		/^[[:space:]]*netmask:/       { mask=$2 }
+		/^[[:space:]]*gateway:/       { gw=$2 }
 		END{ flush() }
 	' "$1" | tr -d "\"'"
 }
 
-# nameserver-блок → DNS|search
+# nameserver-block → DNS|search
 read_dns_search() {
 	awk '
 		BEGIN{dns="";search=""}
-		/^[[:space:]]*-.*type:[[:space:]]*nameserver/{ns=1;next}
-		ns && /^[[:space:]]*address:/{adr=1;next}
-		ns && /^[[:space:]]*search:/{adr=0;srch=1;next}
-		adr && /^[[:space:]]*-[[:space:]]*/{gsub(/[^0-9.]/,"",$2); dns=$2}
-		srch&&/^[[:space:]]*-[[:space:]]*/{gsub(/[^A-Za-z0-9_.-]/,"",$2); search=$2}
-		END{print dns"|"search}
+		/-.*type:[[:space:]]*nameserver/{ns=1;next}
+		ns && /[[:space:]]*address:/{adr=1;next}
+		ns && /[[:space:]]*search:/{adr=0;srch=1;next}
+		adr && /[[:space:]]*-[[:space:]]*/{gsub(/[^0-9.]/,""); dns=$0; adr=srch=ns=0 }
+		srch&&/[[:space:]]*-[[:space:]]*/{gsub(/[^A-Za-z0-9_.-]/,""); search=$0; adr=srch=ns=0 }
+		END{print dns"|",search}
 	' "$1"
 }
 
-apply_network_config() {
-	local cfg="$1"
-
-	# ---- DNS / search ------------------------------------------------------
-	IFS='|' read DNS SEARCH <<EOF
-$(read_dns_search "$cfg")
-EOF
-	DNS=$(echo "$DNS" | tr -d ' ')
-	SEARCH=$(echo "$SEARCH" | tr -d ' ')
-
-	: > /etc/resolv.conf.head
-	[ -n "$SEARCH" ] && echo "search $SEARCH"   >> /etc/resolv.conf.head
-	[ -n "$DNS"    ] && echo "nameserver $DNS" >> /etc/resolv.conf.head
-	cp /etc/resolv.conf.head /etc/resolv.conf
-
-	# ---- UCI сети ----------------------------------------------------------
-	uci -q delete network.@device[0]
-	uci -q delete network.lan
-
-	local idx=0
-	parse_network_config "$cfg" | while IFS='|' read IFACE PROTO IP NM GW; do
-		local name; [ "$idx" = 0 ] && name="wan" || name="lan$idx"
-
-		uci set network.$name=interface
-		uci set network.$name.device="$IFACE"
-		uci set network.$name.proto="${PROTO:-dhcp}"
-
-		if [ "$PROTO" = "static" ]; then
-			[ -n "$IP" ] && uci set network.$name.ipaddr="$IP"
-			[ -n "$NM" ] && uci set network.$name.netmask="$NM"
-			[ -n "$GW" ] && uci set network.$name.gateway="$GW"
-		fi
-
-		# DNS только для первого интерфейса
-		if [ "$idx" = 0 ] && [ -n "$DNS" ]; then
-			uci set network.$name.peerdns='0'
-			uci set network.$name.dns="$DNS"
-		fi
-		idx=$((idx+1))
-	done
-	uci commit network
-
-	# DHCP-сервер на первой LAN (если она есть)
-	if uci -q get network.lan1 > /dev/null 2>&1; then
-		uci set dhcp.lan1=dhcp
-		uci set dhcp.lan1.interface='lan1'
-		uci set dhcp.lan1.start='10'
-		uci set dhcp.lan1.limit='150'
-		uci set dhcp.lan1.leasetime='2m'
-		uci commit dhcp
-		uci set firewall.@zone[1].input='ACCEPT'
-		uci set firewall.@zone[1].forward='ACCEPT'
-		uci commit firewall
-	fi
+mount_cidata() {
+	[ -d "$CIDATA_MNT" ] || mkdir -p "$CIDATA_MNT"
+	mountpoint -q "$CIDATA_MNT" && return 0
+	mount -o ro /dev/sr0 "$CIDATA_MNT" 2>/dev/null
 }
 
+umount_cidata() {
+	mountpoint -q "$CIDATA_MNT" || return 0
+	umount "$CIDATA_MNT"
+	rmdir  "$CIDATA_MNT"
+}
+
+# ————————————————— main ————————————————————————————————
+
 start_service() {
+	# «ds=nocloud» в ядре → пропускаем
+	grep -qE '(\s|^)ds=nocloud' /proc/cmdline && return 0
+
 	mount_cidata || {
-		logger -t rc.cloud-setup "cidata not found on ${CIDATA_DEV} – skipping"
+		logger -t $PROG "cidata not found – skip"
 		return 0
 	}
 
-	# meta-data (только логируем instance-id)
-	if [ -f "$CIDATA_DIR/meta-data" ]; then
-		local iid
-		iid=$(grep -m1 '^instance-id' "$CIDATA_DIR/meta-data" | cut -d' ' -f2-)
-		[ -n "$iid" ] && logger -t rc.cloud-setup "instance-id: $iid"
+	##########################################################################
+	# 0. meta-data (instance-id) — нужен только для логов
+	##########################################################################
+	if [ -f "$CIDATA_MNT/meta-data" ]; then
+		ID=$(awk -F': *' '$1=="instance-id"{print $2;exit}' "$CIDATA_MNT/meta-data")
+		[ -n "$ID" ] && logger -t $PROG "instance-id: $ID"
 	fi
 
-	# network-config → UCI
-	if [ -f "$CIDATA_DIR/network-config" ]; then
-		logger -t rc.cloud-setup "applying network-config"
-		apply_network_config "$CIDATA_DIR/network-config"
+	##########################################################################
+	# 1. network-config  →  UCI + resolv.conf.head
+	##########################################################################
+	if [ -f "$CIDATA_MNT/network-config" ]; then
+		NETCFG="$CIDATA_MNT/network-config"
+		logger -t $PROG "applying network-config"
+
+		# DNS / search
+		IFS='|' read DNS SEARCH <<EOF
+$(read_dns_search "$NETCFG")
+EOF
+		DNS=$(echo "$DNS" | tr -d ' ')
+		SEARCH=$(echo "$SEARCH" | tr -d ' ')
+
+		: > /etc/resolv.conf.head
+		[ -n "$SEARCH" ] && echo "search $SEARCH"   >> /etc/resolv.conf.head
+		[ -n "$DNS"    ] && echo "nameserver $DNS" >> /etc/resolv.conf.head
+		cp /etc/resolv.conf.head /etc/resolv.conf
+
+		# чистый конфиг сети (loopback оставим)
+		uci -q delete network
+		uci set network.loopback=interface
+		uci set network.loopback.device='lo'
+		uci set network.loopback.proto='static'
+		uci set network.loopback.ipaddr='127.0.0.1'
+		uci set network.loopback.netmask='255.0.0.0'
+
+		# physical interfaces
+		INDEX=0
+		parse_network_config "$NETCFG" | while IFS='|' read IFACE PROTO IP NM GW; do
+			NAME=$([ "$INDEX" -eq 0 ] && echo wan || echo lan$INDEX)
+
+			uci batch <<-UCI
+				set network.$NAME=interface
+				set network.$NAME.device='$IFACE'
+				set network.$NAME.proto='${PROTO:-dhcp}'
+			UCI
+
+			if [ "$PROTO" = "static" ]; then
+				[ -n "$IP" ] && uci set network.$NAME.ipaddr="$IP"
+				[ -n "$NM" ] && uci set network.$NAME.netmask="$NM"
+				[ -n "$GW" ] && uci set network.$NAME.gateway="$GW"
+			fi
+
+			if [ "$INDEX" -eq 0 ] && [ -n "$DNS" ]; then
+				uci set network.$NAME.peerdns='0'
+				uci set network.$NAME.dns="$DNS"
+			fi
+			INDEX=$((INDEX+1))
+		done
+		uci commit network
+
+		# DHCP-сервер для первого LAN-порта (lan1)
+		if uci -q get network.lan1 >/dev/null; then
+			uci set dhcp.lan1=dhcp
+			uci set dhcp.lan1.interface='lan1'
+			uci set dhcp.lan1.start='10'
+			uci set dhcp.lan1.limit='150'
+			uci set dhcp.lan1.leasetime='2m'
+			uci commit dhcp
+		fi
+
+		# firewall: разрешим input на LAN-зоне (index 1)
+		uci set firewall.@zone[1].input='ACCEPT'
+		uci set firewall.@zone[1].forward='ACCEPT'
+		uci commit firewall
+
+		# убьём возможный udhcpc на wan перед рестартом сети
+		killall -q udhcpc || true
 		/etc/init.d/network restart
 	fi
-}
 
+	umount_cidata
+}
 stop_service() { :; }
