@@ -10,7 +10,7 @@ define Package/rc.cloud
   SECTION:=base
   CATEGORY:=Base system
   TITLE:=Minimal cloud-init replacement (Config-Drive on /dev/sr0)
-  DEPENDS:=+blkid +wget +jq +kmod-fs-iso9660 +kmod-fs-vfat
+  DEPENDS:=+blkid +wget +jq +kmod-fs-vfat
 endef
 
 define Package/rc.cloud/description
