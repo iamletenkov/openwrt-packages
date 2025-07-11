@@ -12,7 +12,7 @@ define Package/rc.cloud
   SECTION:=utils
   CATEGORY:=Utilities
   TITLE:=Minimal cloud-init implementation for OpenWrt
-  DEPENDS:=+bash +curl +mount-utils +coreutils-stat +coreutils-base64 +uci
+  DEPENDS:=+bash +curl +mount-utils +coreutils-stat +coreutils-base64 +uci +blkid +wget +jq
 endef
 
 define Package/rc.cloud/description
