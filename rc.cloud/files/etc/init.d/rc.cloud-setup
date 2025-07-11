@@ -26,7 +26,7 @@ start() {
     if [[ -n ${md_cd} ]]; then
         msg "found config drive on ${md_cd}"
         mkdir -p ${CD_MNT}
-        mount ${md_cd} ${CD_MNT}
+        mount -t iso9660 -o ro mount ${md_cd} ${CD_MNT}
     fi
 
     msg "getting instance-id"
